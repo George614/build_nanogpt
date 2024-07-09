@@ -68,10 +68,14 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         # self-attention (materializes the large (T, T) matrix for all the queries and keys)
-        att = (q @ k.transpose(-2, -1)) * (1. / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)  # (B, nh, T, T)
-        y = att @ v  # (B, nh, T, hs)
+        # att = (q @ k.transpose(-2, -1)) * (1. / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)  # (B, nh, T, T)
+        # y = att @ v  # (B, nh, T, hs)
+        
+        # flash attention: 199ms -> 157ms
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head ouputs (concat)
         # output project
         y = self.c_proj(y)
@@ -255,7 +259,8 @@ torch.set_float32_matmul_precision('high')
 # after this it took around 396ms
 
 # get logits
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))  # nice number
+# nice number for vocab_size: 157ms -> 149ms
 # device = 'cpu'  # override
 model.to(device)
 # before compile 293ms, after compile 200ms
