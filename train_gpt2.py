@@ -33,6 +33,7 @@ class MLP(nn.Module):
         # to make it run faster, now the exact GELU can be used)
         self.gelu = nn.GELU(approximate="tanh") 
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         
     def forward(self, x):
         x = self.c_fc(x)
@@ -48,6 +49,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -110,8 +112,11 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
     
     def _init_weights(self, module):
+        std = 0.02
+        if hasattr(module, 'NANOGPT_SCALE_INIT'):
+            std *= (2 * self.config.n_layer) ** -0.5
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0., std=.02)
+            torch.nn.init.normal_(module.weight, mean=0., std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -223,6 +228,10 @@ elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
     device = 'mps'
 print(f"Using device {device}")
 
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
 # model = GPT.from_pretrained('gpt2')
 # print("load succeeded!")
 
@@ -241,27 +250,44 @@ buf = buf.to(device)
 x = buf[:-1].view(B, T)
 y = buf[1:].view(B, T)
 
+# before this it took around 500ms on RTX 3090
+torch.set_float32_matmul_precision('high') 
+# after this it took around 396ms
+
 # get logits
 model = GPT(GPTConfig())
 # device = 'cpu'  # override
 model.to(device)
+# before compile 293ms, after compile 200ms
+model = torch.compile(model)
+
 logits, loss = model(x, y)
 print(f"logit shape {logits.shape}")
 print(loss)
 
-train_loader = DataLoaderLite(B=4, T=32)
+import time
+train_loader = DataLoaderLite(B=8, T=1024)
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
+# training loop
 for i in range(50):
+    t0 = time.perf_counter_ns()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        # casting to bfloat16, 396ms -> 293ms
+        logits, loss = model(x, y)
+        # import code; code.interact(local=locals())
     loss.backward()
     optimizer.step()
-    print(f"step {i}, loss {loss.item()}")
+    torch.cuda.synchronize()
+    t1 = time.perf_counter_ns()
+    dt = (t1 - t0) / 1000000.  # in milisecond
+    token_per_sec = (train_loader.B * train_loader.T) / (dt / 1000.)
+    print(f"step {i}, loss {loss.item()}, dt {dt:.2f}ms token/sec {token_per_sec:.2f}")
 
-# import sys; sys.exit(0)
+import sys; sys.exit(0)
 
 #%%
 
