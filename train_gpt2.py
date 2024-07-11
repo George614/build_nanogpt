@@ -1,4 +1,5 @@
 #%%
+import inspect
 import math
 from dataclasses import dataclass
 import torch
@@ -194,6 +195,29 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+    
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # start with all of the candidate parameters that require grad
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any params that is 2D will be weight decayed, otherwise no
+        # i.e. all weight tensors in matmuls + embeddings decay. All biases and layernorm don't
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed params tensors: {len(decay_params)} with {num_decay_params:,} params")
+        print(f"num non-decayed params tensors: {len(nodecay_params)} with {num_nodecay_params:,} params")
+        # create AdamW optimizer and use the fused version if available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
 
 
 class DataLoaderLite:
@@ -258,6 +282,22 @@ y = buf[1:].view(B, T)
 torch.set_float32_matmul_precision('high') 
 # after this it took around 396ms
 
+max_lr = 3e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+def get_lr(it):
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+    if it > max_steps:
+        return min_lr
+    # in between, use cosine decay
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # start at 1 and goes to 0
+    return min_lr  + coeff * (max_lr - min_lr)
+
+
 # get logits
 model = GPT(GPTConfig(vocab_size=50304))  # nice number
 # nice number for vocab_size: 157ms -> 149ms
@@ -272,10 +312,12 @@ print(loss)
 
 import time
 train_loader = DataLoaderLite(B=8, T=1024)
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+# the fused AdamW doesn't show any improments on RTX3090 with torch==2.0.1, pytorch-cuda==11.7
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
 # training loop
-for i in range(50):
+for step in range(max_steps):
     t0 = time.perf_counter_ns()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
@@ -285,12 +327,17 @@ for i in range(50):
         logits, loss = model(x, y)
         # import code; code.interact(local=locals())
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # determine and set the learning rate for this iteration
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.perf_counter_ns()
     dt = (t1 - t0) / 1000000.  # in milisecond
     token_per_sec = (train_loader.B * train_loader.T) / (dt / 1000.)
-    print(f"step {i}, loss {loss.item()}, dt {dt:.2f}ms token/sec {token_per_sec:.2f}")
+    print(f"step {step:4d} | loss {loss.item():.6f} | lr {lr:.4e} | norm {norm:.4f} | dt {dt:.2f}ms | token/sec {token_per_sec:.2f}")
 
 import sys; sys.exit(0)
 
