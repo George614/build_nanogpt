@@ -2,6 +2,7 @@
 import inspect
 import math
 from dataclasses import dataclass
+import time
 import torch
 import torch.backends
 import torch.nn as nn
@@ -247,7 +248,7 @@ class DataLoaderLite:
 
 
 #%%
-####### Test loading from HF ########
+####### Test loading from HuggingFace ########
 # automatically detect device
 device = 'cpu'
 if torch.cuda.is_available():
@@ -310,8 +311,16 @@ logits, loss = model(x, y)
 print(f"logit shape {logits.shape}")
 print(loss)
 
-import time
-train_loader = DataLoaderLite(B=8, T=1024)
+total_batch_size = 524288  # 2**19, roughly 0.5M in number of tokens
+B = 8  # micro batch size
+T = 1024  # sequence length
+assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total desired batch size: {total_batch_size}")
+print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+
+train_loader = DataLoaderLite(B=B, T=T)
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 # the fused AdamW doesn't show any improments on RTX3090 with torch==2.0.1, pytorch-cuda==11.7
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
@@ -319,14 +328,18 @@ optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, dev
 # training loop
 for step in range(max_steps):
     t0 = time.perf_counter_ns()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        # casting to bfloat16, 396ms -> 293ms
-        logits, loss = model(x, y)
-        # import code; code.interact(local=locals())
-    loss.backward()
+    loss_accum = 0.
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            # casting to bfloat16, 396ms -> 293ms
+            logits, loss = model(x, y)
+            # import code; code.interact(local=locals())
+        loss /=  grad_accum_steps  # add the normalizing constant back since the loss will use the mean reudction of a microbatch
+        loss_accum += loss.detach()
+        loss.backward()  # always a += operation on the grads
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # determine and set the learning rate for this iteration
     lr = get_lr(step)
@@ -336,8 +349,9 @@ for step in range(max_steps):
     torch.cuda.synchronize()
     t1 = time.perf_counter_ns()
     dt = (t1 - t0) / 1000000.  # in milisecond
-    token_per_sec = (train_loader.B * train_loader.T) / (dt / 1000.)
-    print(f"step {step:4d} | loss {loss.item():.6f} | lr {lr:.4e} | norm {norm:.4f} | dt {dt:.2f}ms | token/sec {token_per_sec:.2f}")
+    token_processed = train_loader.B * train_loader.T * grad_accum_steps
+    token_per_sec = token_processed / (dt / 1000.)
+    print(f"step {step:4d} | loss {loss_accum.item():.6f} | lr {lr:.4e} | norm {norm:.4f} | dt {dt:.2f}ms | token/sec {token_per_sec:.2f}")
 
 import sys; sys.exit(0)
 
